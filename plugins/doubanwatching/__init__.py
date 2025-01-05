@@ -71,6 +71,7 @@ class DouBanWatching(_PluginBase):
         event_info: WebhookEventInfo = event.event_data
         play_start = {"playback.start", "media.play", "PlaybackStart"}
         path = event_info.item_path
+        channel = event_info.channel
         processed_items: Dict = self.get_data('data') or {}
 
         if (event_info.event in play_start and event_info.user_name in self._user.split(',')) or played:
@@ -78,14 +79,19 @@ class DouBanWatching(_PluginBase):
             if played:
                 logger.info(f"标记播放完成 {event_info.item_name}")
 
-            if not self.exclude_keyword(path=path, keywords=self._exclude).get("ret", False):
-                logger.info(self.exclude_keyword(path=path, keywords=self._exclude).get("message", ""))
+            should_exclude_keyword = self.exclude_keyword(channel=channel, path=path, keywords=self._exclude)
+            if should_exclude_keyword.get("ret", True):
+                logger.info(should_exclude_keyword.get("message", ""))
                 return
 
             if event_info.item_type == "TV":
                 self._process_tv_show(event_info, processed_items, played=played)
-            else:
+            elif event_info.item_type == "MOV":
                 self._process_movie(event_info, processed_items, played=played)
+            else:
+                # 对于 Plex 音乐, MP 的 event_info 没有正确处理类型
+                logger.warn(f"不支持的 item_type: {event_info.item_type}")
+
 
     @eventmanager.register(EventType.WebhookMessage)
     def sync_played(self, event: Event):
@@ -628,19 +634,19 @@ class DouBanWatching(_PluginBase):
         pass
 
     @staticmethod
-    def exclude_keyword(path: str, keywords: str) -> Dict[str, Any]:
+    def exclude_keyword(channel: str, path: str, keywords: str) -> Dict[str, Any]:
         if not keywords:
-            return {"ret": True, "message": "空关键词"}
+            return {"ret": False, "message": "空关键词"}
 
-        if not path:
+        if channel != "plex" and not path:
             logger.warn('媒体路径为空,不执行过滤操作')
-            return {"ret": True, "message": "媒体路径为空,不执行过滤操作"}
+            return {"ret": False, "message": "媒体路径为空,不执行过滤操作"}
 
         keywords_list = re.split(r'[，,]', keywords)
         if any(k in path for k in keywords_list):
-            return {"ret": False, "message": f"路径 {path} 包含 {keywords}"}
+            return {"ret": True, "message": f"路径 {path} 包含 {keywords}"}
 
-        return {"ret": True, "message": f"路径 {path} 不包含任何关键词 {keywords}"}
+        return {"ret": False, "message": f"路径 {path} 不包含任何关键词 {keywords}"}
 
     @staticmethod
     def format_title(title: str, season_id: int) -> str:
