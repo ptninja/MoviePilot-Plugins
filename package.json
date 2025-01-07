@@ -120,7 +120,7 @@
     "description": "Flarum 论坛签到。",
     "labels": "站点",
     "version": "1.0",
-    "icon": "flarum.png",
+    "icon": "https://raw.githubusercontent.com/ptninja/MoviePilot-Plugins/main/icons/flarum.png",
     "author": "ptninja",
     "level": 2,
     "v2": true
