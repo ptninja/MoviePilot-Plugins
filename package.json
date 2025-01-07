@@ -120,8 +120,8 @@
     "description": "Flarum 论坛签到。",
     "labels": "站点",
     "version": "1.0",
-    "icon": "invites.png",
-    "author": "thsrite",
+    "icon": "flarum.png",
+    "author": "ptninja",
     "level": 2,
     "v2": true
   }
