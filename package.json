@@ -114,5 +114,15 @@
     "icon": "https://raw.githubusercontent.com/honue/MoviePilot-Plugins/main/icons/clouddrive.png",
     "author": "honue",
     "level": 3
+  },
+  "FlarumSignin": {
+    "name": "Flarum 论坛签到",
+    "description": "Flarum 论坛签到。",
+    "labels": "站点",
+    "version": "1.0",
+    "icon": "invites.png",
+    "author": "thsrite",
+    "level": 2,
+    "v2": true
   }
 }
