@@ -119,7 +119,7 @@
     "name": "Flarum 论坛签到",
     "description": "Flarum 论坛签到。",
     "labels": "站点",
-    "version": "1.0",
+    "version": "1.0.0",
     "icon": "https://raw.githubusercontent.com/ptninja/MoviePilot-Plugins/main/icons/flarum.png",
     "author": "ptninja",
     "level": 2,
