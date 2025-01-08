@@ -1,194 +1,220 @@
-import threading
-from datetime import datetime
-from typing import Dict, Any, Optional, Tuple, List
-
-from app.chain.media import MediaChain
-from app.core.event import eventmanager, Event
-from app.core.metainfo import MetaInfo
-from app.plugins import _PluginBase
-from app.plugins.doubanwatching.DoubanHelper import DoubanHelper
-from app.schemas import WebhookEventInfo, MediaInfo
-from app.schemas.types import EventType, MediaType
+import json
+import io
 import re
+import time
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+import textwrap
+from ruamel.yaml import YAML, YAMLError
+
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from app.core.config import settings
+from app.plugins import _PluginBase
+from typing import Any, List, Dict, Tuple, Optional
 from app.log import logger
+from app.schemas import NotificationType
+from app.utils.http import RequestUtils
 
-lock = threading.Lock()
+@dataclass
+class FlarumSiteConfig:
+    site_name: str
+    site_url: str
+    cookie: str
 
-
-class DouBanWatching(_PluginBase):
+class FlarumSignin(_PluginBase):
     # 插件名称
-    plugin_name = "豆瓣书影音档案"
+    plugin_name = "Flarum 论坛签到"
     # 插件描述
-    plugin_desc = "将剧集电影的在看、看完状态同步到豆瓣书影音档案。"
+    plugin_desc = "Flarum 论坛签到"
     # 插件图标
-    plugin_icon = "douban.png"
+    plugin_icon = "flarum.png"
     # 插件版本
-    plugin_version = "1.9.5"
+    plugin_version = "1.0"
     # 插件作者
-    plugin_author = "honue"
+    plugin_author = "ptninja"
     # 作者主页
-    author_url = "https://github.com/honue"
+    author_url = "https://github.com/ptninja"
     # 插件配置项ID前缀
-    plugin_config_prefix = "doubanwatching_"
+    plugin_config_prefix = "flarumsignin_"
     # 加载顺序
-    plugin_order = 15
+    plugin_order = 24
     # 可使用的用户级别
-    auth_level = 1
+    auth_level = 2
 
-    _enable = False
-    _private = True
-    _first = True
-    _user = ""
-    _exclude = ""
-    _cookie = ""
+    # 私有属性
+    _enabled = False
+    # 任务执行间隔
+    _cron = None
+    _onlyonce = False
+    _notify = False
+    _history_days = None
+    _site_configs: List[FlarumSiteConfig] = None
 
-    _pc_month = None
-    _pc_num = None
-    _mobile_month = None
-    _mobile_num = None
+    # 定时器
+    _scheduler: Optional[BackgroundScheduler] = None
 
     def init_plugin(self, config: dict = None):
-        config = config or {}
-        self._enable = config.get("enable", False)
-        self._private = config.get("private", True)
-        self._first = config.get("first", True)
-        self._user = config.get("user", "")
-        self._exclude = config.get("exclude", "")
-        self._cookie = config.get("cookie", "")
+        if not config:
+            return False
+        
+        # 停止现有任务
+        self.stop_service()
 
-        self._pc_month = int(config.get("pc_month")) if config.get("pc_month", None) else 3
-        self._pc_num = int(config.get("pc_num", 50)) if config.get("pc_num", None) else 50
-        self._mobile_month = int(config.get("mobile_month")) if config.get("mobile_month", None) else 2
-        self._mobile_num = int(config.get("mobile_num")) if config.get("mobile_num", None) else 15
+        logger.info(f"Loading config")
+        self._enabled = config.get("enabled")
+        self._cron = config.get("cron")
+        self._notify = config.get("notify")
+        self._onlyonce = config.get("onlyonce")
+        self._history_days = config.get("history_days") or 30
+        self._site_configs = self.__load_configs(config.get("flarum_site_configs"))
 
-        if self.get_data("processed"):
-            from app.db.plugindata_oper import PluginDataOper
-            PluginDataOper().del_data(plugin_id="DouBanWatching")
-            logger.warn("检测到本插件旧版本数据，删除旧版本数据，避免报错...")
+        if self._onlyonce:
+            # 定时服务
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            logger.info(f"Flarum 签到服务启动，立即运行一次")
+            self._scheduler.add_job(func=self.signin_all_sites, trigger='date',
+                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                    name="Flarum 签到")
+            # 关闭一次性开关
+            self._onlyonce = False
+            config["onlyonce"] = False
+            self.update_config(config=config)
 
-    @eventmanager.register(EventType.WebhookMessage)
-    def sync_log(self, event: Event, played: bool = False):
-        event_info: WebhookEventInfo = event.event_data
-        play_start = {"playback.start", "media.play", "PlaybackStart"}
-        path = event_info.item_path
-        channel = event_info.channel
-        processed_items: Dict = self.get_data('data') or {}
+            # 启动任务
+            if self._scheduler.get_jobs():
+                self._scheduler.print_jobs()
+                self._scheduler.start()
 
-        if (event_info.event in play_start and event_info.user_name in self._user.split(',')) or played:
-            logger.info(" ")
-            if played:
-                logger.info(f"标记播放完成 {event_info.item_name}")
+    def signin_all_sites(self):
+        """
+        逐个站点签到。可以考虑参考 sitestatistic 多线程签到
+        """
+        logger.info(f"所有签到: {self._site_configs}")
+        for site in self._site_configs:
+            self.signin(site)
 
-            should_exclude_keyword = self.exclude_keyword(channel=channel, path=path, keywords=self._exclude)
-            if should_exclude_keyword.get("ret", True):
-                logger.info(should_exclude_keyword.get("message", ""))
-                return
+    def signin(self, config: FlarumSiteConfig):
+        logger.info(f"开始签到 {config.site_name} ...")
 
-            if event_info.item_type == "TV":
-                self._process_tv_show(event_info, processed_items, played=played)
-            elif event_info.item_type == "MOV":
-                self._process_movie(event_info, processed_items, played=played)
-            else:
-                # 对于 Plex 音乐, MP 的 event_info 没有正确处理类型
-                logger.warn(f"不支持的 item_type: {event_info.item_type}")
-
-
-    @eventmanager.register(EventType.WebhookMessage)
-    def sync_played(self, event: Event):
-        event_info: WebhookEventInfo = event.event_data
-        played = {'item.markplayed', 'media.scrobble'}
-
-        if event_info.event in played and event_info.user_name in self._user.split(','):
-            with lock:
-                self.sync_log(event=event, played=True)
-
-    def _process_tv_show(self, event_info: WebhookEventInfo, processed_items: Dict, played: bool = False):
-        index = event_info.item_name.index(" S")
-        title = event_info.item_name[:index]
-        season_id, episode_id = map(int, [event_info.season_id, event_info.episode_id])
-        tmdb_id = event_info.tmdb_id
-
-        if not played:
-            logger.info(f"开始播放 {title} 第{season_id}季 第{episode_id}集")
-
-        if episode_id < 2 and self._first:
-            logger.info(f"剧集第1集的活动不同步到豆瓣档案，跳过")
+        res = RequestUtils(cookies=config.cookie).get_res(url=config.site_url)
+        if not res or res.status_code != 200:
+            logger.error(f"请求 {config.site_name} 错误")
             return
 
-        meta = MetaInfo(title)
-        meta.begin_season = season_id
-        meta.type = MediaType("电视剧")
-        mediainfo = self._recognize_media(meta, tmdb_id)
-
-        if not mediainfo:
-            logger.warn(f'标题：{title}，tmdbid：{tmdb_id}，指定tmdbid未识别到媒体信息，尝试仅使用标题识别')
-            meta.tmdbid = None
-            mediainfo = self._recognize_media(meta, None)
-            if not mediainfo:
-                logger.error(f'仍然未识别到媒体信息，请检查TMDB网络连接...')
-                return
-
-        episodes = mediainfo.seasons.get(season_id, [])
-
-        title = self.format_title(title, season_id)
-        status = "collect" if len(episodes) == episode_id else "do"
-
-        if processed_items.get(title) and len(episodes) != episode_id:
-            logger.info(f"{title} 已同步到豆瓣在看，不处理")
+        # 获取csrfToken
+        pattern = r'"csrfToken":"(.*?)"'
+        csrfToken = re.findall(pattern, res.text)
+        if not csrfToken:
+            logger.error("请求csrfToken失败")
             return
 
-        self._sync_to_douban(title, status, event_info, processed_items, mediainfo)
+        csrfToken = csrfToken[0]
+        logger.info(f"获取csrfToken成功 {csrfToken}")
 
-    def _process_movie(self, event_info: WebhookEventInfo, processed_items: Dict, played: bool = False):
-        title = event_info.item_name
+        # 获取userid
+        pattern = r'"userId":(\d+)'
+        match = re.search(pattern, res.text)
 
-        if not played:
-            logger.info(f"开始播放 {title}")
-
-        meta = MetaInfo(title)
-        meta.type = MediaType("电影")
-        mediainfo = self._recognize_media(meta, event_info.tmdb_id)
-
-        if not mediainfo:
-            logger.warn(f'标题：{title}，tmdbid：{event_info.tmdb_id}，指定tmdbid未识别到媒体信息，尝试仅使用标题识别')
-            meta.tmdbid = None
-            mediainfo = self._recognize_media(meta, None)
-            if not mediainfo:
-                logger.error(f'仍然未识别到媒体信息，请检查TMDB网络连接...')
-                return
-
-        if processed_items.get(title):
-            logger.info(f"{title} 已同步到豆瓣在看，不处理")
-            return
-
-        self._sync_to_douban(title, "collect", event_info, processed_items, mediainfo)
-
-    def _recognize_media(self, meta: MetaInfo, tmdb_id: Optional[int]) -> Optional[MediaInfo]:
-        return MediaChain().recognize_media(meta=meta, mtype=meta.type, tmdbid=tmdb_id, cache=True)
-
-    def _sync_to_douban(self, title: str, status: str, event_info: WebhookEventInfo, processed_items: Dict,
-                        mediainfo: MediaInfo):
-        logger.info(f"开始尝试获取 {title} 豆瓣id")
-        douban_helper = DoubanHelper(user_cookie=self._cookie)
-        subject_name, subject_id = douban_helper.get_subject_id(title=title)
-
-        if subject_id:
-            logger.info(f"查询：{title} => 匹配豆瓣：{subject_name} https://movie.douban.com/subject/{subject_id}/")
-            ret = douban_helper.set_watching_status(subject_id=subject_id, status=status, private=self._private)
-            if ret:
-                processed_items[title] = {
-                    "subject_id": subject_id,
-                    "subject_name": subject_name,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "poster_path": mediainfo.poster_path,
-                    "type": "电视剧" if event_info.item_type == "TV" else "电影"
-                }
-                self.save_data('data', processed_items)
-                logger.info(f"{title} 同步到档案成功")
-            else:
-                logger.info(f"{title} 同步到档案失败")
+        if match:
+            userId = match.group(1)
+            logger.info(f"获取userid成功 {userId}")
         else:
-            logger.warn(f"获取 {title} subject_id 失败，本条目不存在于豆瓣，或请检查cookie")
+            logger.error("未找到userId")
+            return
+
+        headers = {
+            "X-CSRF-Token": csrfToken,
+            "X-HTTP-Method-Override": "PATCH",
+            "Cookie": config.cookie,
+        }
+
+        data = {
+            "data": {
+                "type": "users",
+                "attributes": {
+                    "canCheckin": False,
+                    "totalContinuousCheckIn": 2
+                },
+                "id": userId
+            }
+        }
+
+        # 开始签到
+        res = RequestUtils(headers=headers).post(url=f"{config.site_url}/api/users/{userId}", json=data)
+
+        if not res or res.status_code != 200:
+            logger.error(f"{config.site_name} 签到失败")
+
+            # 发送通知
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.SiteMessage,
+                    title=f"【{config.site_name} 签到任务完成】",
+                    text="签到失败，请检查cookie是否失效")
+            return
+
+        sign_dict = json.loads(res.text)
+        money = sign_dict['data']['attributes']['money']
+        totalContinuousCheckIn = sign_dict['data']['attributes']['totalContinuousCheckIn']
+
+        # 发送通知
+        if self._notify:
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=f"【{config.site_name} 签到任务完成】",
+                text=f"累计签到 {totalContinuousCheckIn} \n"
+                     f"剩余积分 {money}")
+
+        # 读取历史记录
+        history = self.get_data('history') or []
+
+        history.append({
+            "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
+            "siteName": config.site_name,
+            "totalContinuousCheckIn": totalContinuousCheckIn,
+            "money": money,
+        })
+
+        thirty_days_ago = time.time() - int(self._history_days) * 24 * 60 * 60
+        history = [record for record in history if
+                   datetime.strptime(record["date"],
+                                     '%Y-%m-%d %H:%M:%S').timestamp() >= thirty_days_ago]
+        # 保存签到历史
+        self.save_data(key="history", value=history)
+
+    def get_state(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        pass
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        pass
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """
+        注册插件公共服务
+        [{
+            "id": "服务ID",
+            "name": "服务名称",
+            "trigger": "触发器：cron/interval/date/CronTrigger.from_crontab()",
+            "func": self.xxx,
+            "kwargs": {} # 定时器参数
+        }]
+        """
+        if self._enabled and self._cron:
+            return [{
+                "id": "FlarumSignin",
+                "name": "Flarum 签到服务",
+                "trigger": CronTrigger.from_crontab(self._cron),
+                "func": self.signin_all_sites,
+                "kwargs": {}
+            }]
+        return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
@@ -211,12 +237,13 @@ class DouBanWatching(_PluginBase):
                                     {
                                         'component': 'VSwitch',
                                         'props': {
-                                            'model': 'enable',
+                                            'model': 'enabled',
                                             'label': '启用插件',
                                         }
                                     }
                                 ]
-                            }, {
+                            },
+                            {
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
@@ -226,12 +253,13 @@ class DouBanWatching(_PluginBase):
                                     {
                                         'component': 'VSwitch',
                                         'props': {
-                                            'model': 'private',
-                                            'label': '仅自己可见',
+                                            'model': 'notify',
+                                            'label': '开启通知',
                                         }
                                     }
                                 ]
-                            }, {
+                            },
+                            {
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
@@ -241,8 +269,8 @@ class DouBanWatching(_PluginBase):
                                     {
                                         'component': 'VSwitch',
                                         'props': {
-                                            'model': 'first',
-                                            'label': '不标记第一集',
+                                            'model': 'onlyonce',
+                                            'label': '立即运行一次',
                                         }
                                     }
                                 ]
@@ -262,9 +290,8 @@ class DouBanWatching(_PluginBase):
                                     {
                                         'component': 'VTextField',
                                         'props': {
-                                            'model': 'user',
-                                            'label': '媒体库用户名',
-                                            'placeholder': '多个关键词以,分隔',
+                                            'model': 'cron',
+                                            'label': '签到周期'
                                         }
                                     }
                                 ]
@@ -279,126 +306,39 @@ class DouBanWatching(_PluginBase):
                                     {
                                         'component': 'VTextField',
                                         'props': {
-                                            'model': 'exclude',
-                                            'label': '媒体路径排除关键词',
-                                            'placeholder': '多个关键词以,分隔',
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 12
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'cookie',
-                                            'label': '豆瓣cookie',
-                                            'placeholder': '留空则每次从cookiecloud获取',
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'pc_month',
-                                            'label': '大屏幕显示月份数',
-                                            'placeholder': '默认3个月，最少两个月',
-                                        }
-                                    }
-                                ]
-                            }, {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'pc_num',
-                                            'label': '大屏幕每月最多显示数',
-                                            'placeholder': '50',
-                                        }
-                                    }
-                                ]
-                            }, {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'mobile_month',
-                                            'label': '小屏幕屏幕显示月份数',
-                                            'placeholder': '默认2个月，最少两个月',
-                                        }
-                                    }
-                                ]
-                            }, {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'mobile_num',
-                                            'label': '小屏幕每月最多显示数',
-                                            'placeholder': '15',
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': '需要开启媒体服务器的webhook，需要浏览器登录豆瓣，将豆瓣的cookie同步到cookiecloud，也可以手动将cookie填写到此处，不异地登陆有效期很久。'
+                                            'model': 'history_days',
+                                            'label': '保留历史天数'
                                         }
                                     }
                                 ]
                             },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VAceEditor',
+                                        'props': {
+                                            'modelvalue': 'flarum_site_configs',
+                                            'lang': 'yaml',
+                                            'theme': 'monokai',
+                                            'style': 'height: 25rem'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
                             {
                                 'component': 'VCol',
                                 'props': {
@@ -410,22 +350,7 @@ class DouBanWatching(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': 'v1.8+ 解决了容易提示cookie失效，导致同步失败的问题，现在用cookiecloud应该不用填保活了,建议使用cookiecloud。'
-                                        }
-                                    }
-                                ]
-                            }, {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': 'v1.9.0 支持标记已观看同步，播放自动同步。'
+                                            'text': '整点定时签到失败？不妨换个时间试试'
                                         }
                                     }
                                 ]
@@ -435,222 +360,181 @@ class DouBanWatching(_PluginBase):
                 ]
             }
         ], {
-            "enable": False,
-            "private": True,
-            "first": True,
-            "user": '',
-            "exclude": '',
-            "cookie": "",
-            "pc_month": 3,
-            "pc_num": 50,
-            "mobile_month": 2,
-            "mobile_num": 15,
+            "enabled": False,
+            "onlyonce": False,
+            "notify": False,
+            "history_days": 30,
+            "cron": "0 9 * * *",
+            "flarum_site_configs": self.__get_demo_config()
         }
 
-    def get_dashboard(self, **kwargs) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], List[dict]]]:
-        cols = {
-            "cols": 12, "md": 12
-        }
-        mobile = self.is_mobile(kwargs.get('user_agent'))
-        attrs = {"refresh": 600, "border": False}
-        elements = [
+    def get_page(self) -> List[dict]:
+        historys = self.get_data('history')
+        if not historys:
+            return [
+                {
+                    'component': 'div',
+                    'text': '暂无数据',
+                    'props': {
+                        'class': 'text-center',
+                    }
+                }
+            ]
+
+        if not isinstance(historys, list):
+            historys = [historys]
+
+        # 按照签到时间倒序
+        historys = sorted(historys, key=lambda x: x.get("date") or 0, reverse=True)
+
+        # 签到消息
+        sign_msgs = [
             {
-                'component': 'VRow',
+                'component': 'tr',
                 'props': {
+                    'class': 'text-sm'
                 },
                 'content': [
                     {
-                        'component': 'VTimeline',
+                        'component': 'td',
                         'props': {
-                            'dot-color': '#AF85FD',
-                            'direction': "vertical",
-                            'style': 'padding: 1rem 1rem 1rem 1rem',
-                            'hide-opposite': True,
-                            'side': 'end',
-                            'align': 'start'
+                            'class': 'whitespace-nowrap break-keep text-high-emphasis'
                         },
-                        "content": self.get_line_item(mobile=mobile)
+                        'text': history.get("date")
+                    },
+                    {
+                        'component': 'td',
+                        'text': history.get("siteName")
+                    },
+                    {
+                        'component': 'td',
+                        'text': history.get("totalContinuousCheckIn")
+                    },
+                    {
+                        'component': 'td',
+                        'text': history.get("money")
+                    }
+                ]
+            } for history in historys
+        ]
+
+        # 拼装页面
+        return [
+            {
+                'component': 'VRow',
+                'content': [
+                    {
+                        'component': 'VCol',
+                        'props': {
+                            'cols': 12,
+                        },
+                        'content': [
+                            {
+                                'component': 'VTable',
+                                'props': {
+                                    'hover': True
+                                },
+                                'content': [
+                                    {
+                                        'component': 'thead',
+                                        'content': [
+                                            {
+                                                'component': 'th',
+                                                'props': {
+                                                    'class': 'text-start ps-4'
+                                                },
+                                                'text': '时间'
+                                            },
+                                            {
+                                                'component': 'th',
+                                                'props': {
+                                                    'class': 'text-start ps-4'
+                                                },
+                                                'text': '站点'
+                                            },
+                                            {
+                                                'component': 'th',
+                                                'props': {
+                                                    'class': 'text-start ps-4'
+                                                },
+                                                'text': '连续签到次数'
+                                            },
+                                            {
+                                                'component': 'th',
+                                                'props': {
+                                                    'class': 'text-start ps-4'
+                                                },
+                                                'text': '剩余积分'
+                                            },
+                                        ]
+                                    },
+                                    {
+                                        'component': 'tbody',
+                                        'content': sign_msgs
+                                    }
+                                ]
+                            }
+                        ]
                     }
                 ]
             }
         ]
 
-        return cols, attrs, elements
+    def __load_configs(self, config_str: Optional[str]) -> List[FlarumSiteConfig]:
+        """加载YAML配置字符串，并构造 FlarumSiteConfig 列表。
 
-    def get_line_item(self, mobile: bool = False):
+        Args:
+        config_str (str): 配置内容的字符串。
+
+        Returns:
+        List[ClassifierConfig]: 从配置字符串解析出的配置列表。
         """
-        processed_items[f"{title}"] = {
-                        "subject_id": subject_id,
-                        "subject_name": subject_name,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    }
+        if not config_str:
+            return []
+
+        yaml = YAML(typ="safe")
+        try:
+            data = yaml.load(io.StringIO(config_str))
+            return [FlarumSiteConfig(**item) for item in data]
+        except YAMLError as e:
+            self.__log_and_notify_error(f"YAML parsing error: {e}")
+            return []  # 返回空列表或根据需要做进一步的错误处理
+        except Exception as e:
+            self.__log_and_notify_error(f"Unexpected error during YAML parsing: {e}")
+            return []  # 处理任何意外的异常，返回空列表或其它适当的错误响应
+
+    def __log_and_notify_error(self, message):
         """
-        data: Dict = self.get_data('data') or {}
-        content = []
-
-        # 按月分组
-        last_month = None
-        current_month_item = None
-        # 限制显示月数
-        limit_month = self._mobile_month if mobile else self._pc_month
-        limit_month -= 1
-        # 限制每月最多显示数
-        limit_num = self._mobile_num if mobile else self._pc_num
-
-        # 将字典按照 timestamp 排序
-        sorted_data = sorted(data.items(),
-                             key=lambda item: datetime.strptime(item[1]['timestamp'], "%Y-%m-%d %H:%M:%S"))
-
-        for key, val in sorted_data[::-1]:
-            if not isinstance(val, dict):
-                continue
-            if not val.get('poster_path', ''):
-                meta = MetaInfo(val.get("subject_name"))
-                meta.type = MediaType("电视剧" if not val.get("type", '') else val.get("type"))
-                # 识别媒体信息
-                mediainfo: MediaInfo = MediaChain().recognize_media(meta=meta, mtype=meta.type,
-                                                                    cache=True)
-                if mediainfo:
-                    poster_path = mediainfo.poster_path
-                else:
-                    continue
-            else:
-                poster_path = val.get('poster_path')
-
-            time_object = datetime.strptime(val.get('timestamp'), "%Y-%m-%d %H:%M:%S")
-
-            if time_object.month != last_month or last_month is None:
-                if limit_month < 1:
-                    break
-                if last_month:
-                    num_movies = len(current_month_item["content"][0]["content"][1]["content"])
-                    current_month_item["content"][0]["content"][0][
-                        "html"] += f"<span class='text-sm font-normal'>看过{num_movies}部</span>"
-                    # 截取limit_num
-                    current_month_item["content"][0]["content"][1]["content"] = \
-                        current_month_item["content"][0]["content"][1]["content"][:limit_num]
-                    content.append(current_month_item)
-                    limit_month -= 1
-
-                # 新的一月
-                # 初始化 current_month_item 模板
-                current_month_item = {
-                    "component": "VTimelineItem",
-                    "props": {
-                        "size": "x-small",
-                    },
-                    "content": [
-                        {
-                            "component": "VCol",
-                            'props': {
-                                'style': 'padding: 0rem 0rem 0rem 0rem'
-                            },
-                            'content': [
-                                {
-                                    'component': 'h1',
-                                    'props': {
-                                        'style': 'padding:0rem 0rem 1rem 0rem;font-weight: bold;',
-                                        'class': 'text-base'
-                                    },
-                                    'html': f"{time_object.month}月 ",
-                                },
-                                {
-                                    'component': 'VRow',
-                                    'props': {
-                                        'style': 'padding: 0rem 0rem 0rem 0rem'
-                                    },
-                                    'content': []
-                                }
-                            ]
-                        }
-                    ]
-                }
-                last_month = time_object.month
-            if not poster_path or (poster_path.count('original') < 1):
-                continue
-            current_month_item["content"][0]["content"][1]["content"].append({
-                "component": "a",
-                'props': {
-                    'href': 'https://www.douban.com/doubanapp/dispatch?uri=/movie/' + val.get(
-                        'subject_id') + '?from=mdouban&open=app',
-                    'target': '_blank',
-                    # 图片卡片间的间距 上 右 下 左
-                    # 'style': 'padding: 1rem 0.5rem 1rem 0.5rem'
-                    'style': 'padding: 0.2rem'
-                },
-                "content": [
-                    {
-                        "component": "VCard",
-                        "props": {
-                            "class": "elevation-4"
-                        },
-                        "content": [
-                            {
-                                "component": "VImg",
-                                "props": {
-                                    "src": poster_path.replace("/original/", "/w200/"),
-                                    "style": "width:44px; height: 66px;" if mobile else "width:66px; height: 99px;",
-                                    "aspect-ratio": "2/3"
-                                }
-                            }
-                        ]
-                    }
-                ]
-            })
-
-        if current_month_item:
-            num_movies = len(current_month_item["content"][0]["content"][1]["content"])
-            current_month_item["content"][0]["content"][0][
-                "html"] += f"<span class='text-sm font-normal'>看过{num_movies}部</span>"
-            current_month_item["content"][0]["content"][1]["content"] = \
-                current_month_item["content"][0]["content"][1]["content"][:limit_num]
-            content.append(current_month_item)
-        return content
-
+        记录错误日志并发送系统通知
+        """
+        logger.error(message)
+        self.systemmessage.put(message, title="Flarum 论坛签到")
+        
     @staticmethod
-    def is_mobile(user_agent):
-        mobile_keywords = [
-            'Mobile', 'Android', 'Silk/', 'Kindle', 'BlackBerry', 'Opera Mini', 'Opera Mobi', 'iPhone', 'iPad'
-        ]
-        for keyword in mobile_keywords:
-            if re.search(keyword, user_agent, re.IGNORECASE):
-                return True
-        return False
+    def __get_demo_config():
+        """获取默认配置"""
 
-    def get_page(self) -> List[dict]:
-        pass
-
-    def get_state(self) -> bool:
-        return self._enable
+        block = """\
+            ####### 配置说明 BEGIN #######
+            - site_name: invites
+              site_url: https://invites.fun
+              cookie: xxx
+              
+            - site_name: hddolby
+              site_url: https://forums.orcinusorca.org
+              cookie: yyy
+        """
+        return textwrap.dedent(block)
 
     def stop_service(self):
-        pass
-
-    @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
-        pass
-
-    def get_api(self) -> List[Dict[str, Any]]:
-        pass
-
-    @staticmethod
-    def exclude_keyword(channel: str, path: str, keywords: str) -> Dict[str, Any]:
-        if not keywords:
-            return {"ret": False, "message": "空关键词"}
-
-        if channel != "plex" and not path:
-            logger.warn('媒体路径为空,不执行过滤操作')
-            return {"ret": False, "message": "媒体路径为空,不执行过滤操作"}
-
-        keywords_list = re.split(r'[，,]', keywords)
-        if any(k in path for k in keywords_list):
-            return {"ret": True, "message": f"路径 {path} 包含 {keywords}"}
-
-        return {"ret": False, "message": f"路径 {path} 不包含任何关键词 {keywords}"}
-
-    @staticmethod
-    def format_title(title: str, season_id: int) -> str:
-        if season_id > 1:
-            return f"{title} 第{season_id}季"
-        else:
-            return title
+        """
+        退出插件
+        """
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception as e:
+            logger.error("退出插件失败：%s" % str(e))
