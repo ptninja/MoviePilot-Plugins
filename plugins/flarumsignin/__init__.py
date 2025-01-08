@@ -30,7 +30,7 @@ class FlarumSignin(_PluginBase):
     # 插件描述
     plugin_desc = "Flarum 论坛签到"
     # 插件图标
-    plugin_icon = "flarum.png"
+    plugin_icon = "https://raw.githubusercontent.com/ptninja/MoviePilot-Plugins/main/icons/flarum.png"
     # 插件版本
     plugin_version = "1.0.0"
     # 插件作者
