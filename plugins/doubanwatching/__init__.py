@@ -1,5 +1,8 @@
+import json
+import os
 import re
 import threading
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,6 +16,21 @@ from app.schemas import MediaInfo, WebhookEventInfo
 from app.schemas.types import EventType, MediaType
 
 lock = threading.Lock()
+
+
+@dataclass
+class DouBanWatchingConfig:
+    enabled: bool
+    private: bool  # 仅自己可见
+    first: bool  # 不标记第一集
+    user: str  # 媒体库用户名
+    exclude: str  # 路径排除关键词
+    cookie: str  # 豆瓣 cookie
+
+    pc_month: int  # 大屏幕显示月份数
+    pc_num: int  # 大屏幕每月最多显示数
+    mobile_month: int  # 小屏幕显示月份数
+    mobile_num: int  # 小屏幕每月最多显示数
 
 
 class DouBanWatching(_PluginBase):
@@ -35,38 +53,22 @@ class DouBanWatching(_PluginBase):
     # 可使用的用户级别
     auth_level = 1
 
-    _enable = False
-    _private = True
-    _first = True
-    _user = ""
-    _exclude = ""
-    _cookie = ""
-
-    _pc_month = None
-    _pc_num = None
-    _mobile_month = None
-    _mobile_num = None
+    _plugin_config: DouBanWatchingConfig = None
 
     def init_plugin(self, config: dict = None):
         config = config or {}
-        self._enable = config.get("enable", False)
-        self._private = config.get("private", True)
-        self._first = config.get("first", True)
-        self._user = config.get("user", "")
-        self._exclude = config.get("exclude", "")
-        self._cookie = config.get("cookie", "")
 
-        self._pc_month = (
-            int(config.get("pc_month")) if config.get("pc_month", None) else 3
-        )
-        self._pc_num = (
-            int(config.get("pc_num", 50)) if config.get("pc_num", None) else 50
-        )
-        self._mobile_month = (
-            int(config.get("mobile_month")) if config.get("mobile_month", None) else 2
-        )
-        self._mobile_num = (
-            int(config.get("mobile_num")) if config.get("mobile_num", None) else 15
+        self._plugin_config = DouBanWatchingConfig(
+            enabled=config.get("enable", False),
+            private=config.get("private", True),
+            first=config.get("first", True),
+            user=config.get("user", ""),
+            exclude=config.get("exclude", ""),
+            cookie=config.get("cookie", ""),
+            pc_month=int(config.get("pc_month") or 3),
+            pc_num=int(config.get("pc_num") or 50),
+            mobile_month=int(config.get("mobile_month") or 2),
+            mobile_num=int(config.get("mobile_num") or 15),
         )
 
         if self.get_data("processed"):
@@ -74,6 +76,16 @@ class DouBanWatching(_PluginBase):
 
             PluginDataOper().del_data(plugin_id="DouBanWatching")
             logger.warn("检测到本插件旧版本数据，删除旧版本数据，避免报错...")
+
+        if config.get("run_backup"):
+            config["run_backup"] = False
+            backup_path = config.get("backup_path", self.get_data_path())
+            self._export_config_data(backup_path)
+
+        if config.get("run_restore"):
+            config["run_restore"] = False
+            backup_path = config.get("backup_path")
+            self._import_config_data(backup_path)
 
     @eventmanager.register(EventType.WebhookMessage)
     def sync_log(self, event: Event, played: bool = False):
@@ -85,14 +97,14 @@ class DouBanWatching(_PluginBase):
 
         if (
             event_info.event in play_start
-            and event_info.user_name in self._user.split(",")
+            and event_info.user_name in self._plugin_config.user.split(",")
         ) or played:
             logger.info(" ")
             if played:
                 logger.info(f"标记播放完成 {event_info.item_name}")
 
             should_exclude_keyword = self.exclude_keyword(
-                channel=channel, path=path, keywords=self._exclude
+                channel=channel, path=path, keywords=self._plugin_config.exclude
             )
             if should_exclude_keyword.get("ret", True):
                 logger.info(should_exclude_keyword.get("message", ""))
@@ -111,7 +123,10 @@ class DouBanWatching(_PluginBase):
         event_info: WebhookEventInfo = event.event_data
         played = {"item.markplayed", "media.scrobble"}
 
-        if event_info.event in played and event_info.user_name in self._user.split(","):
+        if (
+            event_info.event in played
+            and event_info.user_name in self._plugin_config.user.split(",")
+        ):
             with lock:
                 self.sync_log(event=event, played=True)
 
@@ -126,7 +141,7 @@ class DouBanWatching(_PluginBase):
         if not played:
             logger.info(f"开始播放 {title} 第{season_id}季 第{episode_id}集")
 
-        if episode_id < 2 and self._first:
+        if episode_id < 2 and self._plugin_config.first:
             logger.info(f"剧集第1集的活动不同步到豆瓣档案，跳过")
             return
 
@@ -200,7 +215,7 @@ class DouBanWatching(_PluginBase):
         mediainfo: MediaInfo,
     ):
         logger.info(f"开始尝试获取 {title} 豆瓣id")
-        douban_helper = DoubanHelper(user_cookie=self._cookie)
+        douban_helper = DoubanHelper(user_cookie=self._plugin_config.cookie)
         subject_name, subject_id = douban_helper.get_subject_id(title=title)
 
         if subject_id:
@@ -208,7 +223,9 @@ class DouBanWatching(_PluginBase):
                 f"查询：{title} => 匹配豆瓣：{subject_name} https://movie.douban.com/subject/{subject_id}/"
             )
             ret = douban_helper.set_watching_status(
-                subject_id=subject_id, status=status, private=self._private
+                subject_id=subject_id,
+                status=status,
+                private=self._plugin_config.private,
             )
             if ret:
                 processed_items[title] = {
@@ -397,6 +414,55 @@ class DouBanWatching(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "run_backup",
+                                            "label": "备份数据",
+                                            "hint": "备份或恢复数据只会执行一次",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "run_restore",
+                                            "label": "恢复数据",
+                                            "hint": "优先执行备份",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "backup_path",
+                                            "label": "备份保存路径(或恢复数据文件路径)",
+                                            "placeholder": f"默认为插件数据路径 config/plugins/DouBanWatching",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {
                                     "cols": 12,
                                 },
@@ -451,6 +517,8 @@ class DouBanWatching(_PluginBase):
             "enable": False,
             "private": True,
             "first": True,
+            "run_backup": False,
+            "run_restore": False,
             "user": "",
             "exclude": "",
             "cookie": "",
@@ -459,6 +527,44 @@ class DouBanWatching(_PluginBase):
             "mobile_month": 2,
             "mobile_num": 15,
         }
+
+    def _export_config_data(self, path: str):
+        current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        backup_file_name = f"{self.plugin_config_prefix}{current_time}.json"
+        full_path = os.path.join(path, backup_file_name)
+
+        with open(full_path, "w") as file:
+            json.dump(
+                {
+                    "_plugin_config": asdict(self._plugin_config),
+                    "data": self.get_data("data") or {},
+                },
+                file,
+                indent=4,
+            )
+
+        logger.info(f"Exported config and data to {full_path}")
+
+    def _import_config_data(self, path_to_file: str):
+        try:
+            with open(path_to_file, "r") as file:
+                backup_data = json.load(file)
+
+                config = backup_data["_plugin_config"]
+                import_data = backup_data["data"]
+                existing_data: Dict = self.get_data("data") or {}
+                merged_data = existing_data | import_data
+
+                self.update_config(config=config)
+                self.save_data("data", merged_data)
+
+            logger.info(
+                f"Successfully imported config and added {len(import_data)} processed items. Total: {len(merged_data)}"
+            )
+        except FileNotFoundError:
+            logger.error(f"Backup file '{path_to_file}' does not exist! ")
+        except Exception as e:
+            logger.error(f"位置错误: {e}")
 
     def get_dashboard(
         self, **kwargs
@@ -504,10 +610,14 @@ class DouBanWatching(_PluginBase):
         last_month = None
         current_month_item = None
         # 限制显示月数
-        limit_month = self._mobile_month if mobile else self._pc_month
+        limit_month = (
+            self._plugin_config.mobile_month if mobile else self._plugin_config.pc_month
+        )
         limit_month -= 1
         # 限制每月最多显示数
-        limit_num = self._mobile_num if mobile else self._pc_num
+        limit_num = (
+            self._plugin_config.mobile_num if mobile else self._plugin_config.pc_num
+        )
 
         # 将字典按照 timestamp 排序
         sorted_data = sorted(
@@ -659,7 +769,7 @@ class DouBanWatching(_PluginBase):
         pass
 
     def get_state(self) -> bool:
-        return self._enable
+        return self._plugin_config.enabled
 
     def stop_service(self):
         pass
